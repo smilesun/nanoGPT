@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -51,8 +52,25 @@ class CausalSelfAttention(nn.Module):
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            # XS: bias
+            # XS: lower triangular, use argument diag to decide which
+            # parallel diagonal line to keep
+            # >>> a = torch.randn(3, 3)
+            # >>> a
+            # tensor([[-1.0813, -0.8619,  0.7105],
+            #         [ 0.0935,  0.1380,  2.2112],
+            #         [-0.3409, -0.9828,  0.0289]])
+            # >>> torch.tril(a)
+            # tensor([[-1.0813,  0.0000,  0.0000],
+            #         [ 0.0935,  0.1380,  0.0000],
+            #         [-0.3409, -0.9828,  0.0289]])
+
+            self.register_buffer("bias",
+                                 torch.tril(
+                                     torch.ones(
+                                         config.block_size, config.block_size)
+                                 ).view(1, 1, config.block_size,
+                                              config.block_size))  # context window
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -79,6 +97,7 @@ class CausalSelfAttention(nn.Module):
             # mask: A boolean tensor with the same shape as the input tensor
             # value: The value to fill in where the mask is True
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # self.bias is defined in the init function as lower triangular
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)

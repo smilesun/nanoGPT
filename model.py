@@ -72,6 +72,12 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            # torch.Tensor.masked_fill fills elements
+            # of a tensor with a specified value where a given mask is True
+            # Here's how it works: torch.Tensor.masked_fill(mask, value)
+            # Parameters:
+            # mask: A boolean tensor with the same shape as the input tensor
+            # value: The value to fill in where the mask is True
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)

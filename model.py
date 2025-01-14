@@ -24,7 +24,9 @@ class LayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias,
+                            1e-5)
+
 
 class CausalSelfAttention(nn.Module):
 
@@ -32,8 +34,11 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
+        # 3: Q, K, V
+        # c_attn is for input linear transform
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd,
+                                bias=config.bias)
+        # **output** projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -51,9 +56,12 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # split: Splits the tensor into chunks. Each chunk is a view of the original tensor.
+        # If :attr:`split_size_or_sections` is an integer type, then :attr:`tensor` will
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # embed dim divided by num heads,
+        # so that the result of the matmul is of size (B, nh, T, T)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -69,6 +77,8 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            # each token get a unique representation of size h_s for each head
+            # C is the size of embedding, divided into num_head(n_h) * hs
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection

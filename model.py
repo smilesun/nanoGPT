@@ -76,6 +76,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()
+        # T can be 1 for generative task during inference time
         # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head
         # forward to be the batch dim
@@ -117,7 +118,13 @@ class CausalSelfAttention(nn.Module):
             # as lower triangular (1, 1, config.block_size, config.block_size)
             # where config.block_size is the length of the context window
             # for each B, num_heads, we have the same mask for (T, T) where
-            # T=config.block_size is the length of the context window
+            # ****
+            # T=config.block_size is the length of the context window during
+            # training and T can be 1 at inference time for generation token
+            # without padding;
+            # if there is padding, attention mask will make
+            # PAD position irrelevant.
+            # ****
             # upper triangular is zero, lower triangular is one
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             # (T,T) attention matrix have [i,j>i] set to -inf, here j is the
@@ -273,7 +280,7 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         device = idx.device
-        b, t = idx.size()
+        b, t = idx.size()   # t can be 1 or 0 for start of generation
         assert t <= \
             self.config.block_size, \
             f"Cannot forward sequence of length {t}, \
@@ -288,17 +295,19 @@ class GPT(nn.Module):
         #     h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         #     ln_f=LayerNorm(config.n_embd, bias=config.bias),
         # ))
-
+        # forward idx with nn.Embedding(config.vocab_size, config.n_embd) will
+        # return token embeddings of shape (b, t, n_embd) since idx is of shape
+        # (b, t), note that $t$ can be 1 for initial generation
         tok_emb = self.transformer.wte(idx)  # wte is key in ModuleDict
         # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos)
         # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        for block in self.transformer.h:  # ModuleList of decoder
             x = block(x)  # attention representation of each token
         x = self.transformer.ln_f(x)   # layer norm
 
-        if targets is not None:
+        if targets is not None:  # training task
             # if we are given some desired targets also calculate the loss
 
             # def: self.lm_head = nn.Linear(
@@ -307,7 +316,7 @@ class GPT(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1), ignore_index=-1)
-        else:
+        else:  # generation task
             # inference-time mini-optimization:
             # only forward the lm_head on the very last position
             # "x[:, [-1], :]" does the following:
@@ -323,19 +332,22 @@ class GPT(nn.Module):
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+        # e.g. we may load the GPT2 pretrained model checkpoint
+        # (block size 1024)
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        self.transformer.wpe.weight = nn.Parameter(
+            self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+                block.attn.bias = block.attn.bias[:, :, :block_size,
+                                                  :block_size]
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
+        override_args = override_args or {}  # default to empty dict
         # only dropout can be overridden see more notes below
         assert all(k == 'dropout' for k in override_args)
         from transformers import GPT2LMHeadModel
@@ -343,10 +355,14 @@ class GPT(nn.Module):
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),
+            # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024),
+            # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280),
+            # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
+            # 1558M params
         }[model_type]
         print("forcing vocab_size=50257, block_size=1024, bias=True")
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
@@ -434,16 +450,24 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t))
+        and complete the sequence max_new_tokens times,
+        feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of
+        operation for this.
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # if the sequence context is growing too long we must crop it at
+            # block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else \
+                idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+            logits, _ = self(idx_cond)  # recursive forward pass
+            # pluck the logits at the final step and scale by
+            # desired temperature
+            # pluck in English means to pick or pull something out
+            # logits[:, [-1], :] will retain the order of tensor while without
+            #  [] will flatten the tensor
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
@@ -454,6 +478,7 @@ class GPT(nn.Module):
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            idx = torch.cat((idx, idx_next), dim=1)  # same name
+            # as from argument
 
         return idx

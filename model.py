@@ -12,12 +12,13 @@ import inspect
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.nn import functional as F
 
 
 class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+    """ LayerNorm but with an optional bias.
+    PyTorch doesn't support simply bias=False """
 
     def __init__(self, ndim, bias):
         super().__init__()
@@ -47,11 +48,14 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        # flash attention make GPU go brr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional,
+                             'scaled_dot_product_attention')
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
+            print("WARNING: using slow attention. \
+                  Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left
+            # in the input sequence
             # XS: bias
             # XS: lower triangular, use argument diag to decide which
             # parallel diagonal line to keep
@@ -65,12 +69,10 @@ class CausalSelfAttention(nn.Module):
             #         [ 0.0935,  0.1380,  0.0000],
             #         [-0.3409, -0.9828,  0.0289]])
 
-            self.register_buffer("bias",
-                                 torch.tril(
-                                     torch.ones(
-                                         config.block_size, config.block_size)
-                                 ).view(1, 1, config.block_size,
-                                              config.block_size))  # context window
+            self.register_buffer("bias", torch.tril(
+                torch.ones(config.block_size, config.block_size)).view(
+                    1, 1, config.block_size, config.block_size))
+            # config.block_size: context window
 
     def forward(self, x):
         B, T, C = x.size()
@@ -79,10 +81,11 @@ class CausalSelfAttention(nn.Module):
         # forward to be the batch dim
         # split: Splits the tensor into chunks.
         # Each chunk is a view of the original tensor.
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)  # along dim=2
         # embed dim divided by num heads,
         # so that the result of the matmul is of size (B, nh, T, T)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        # transpose(1, 2) switch num_heads and sequence length dimensions
         # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         # (B, nh, T, hs)
@@ -104,18 +107,57 @@ class CausalSelfAttention(nn.Module):
             # Parameters:
             # mask: A boolean tensor with the same shape as the input tensor
             # value: The value to fill in where the mask is True
+            # k.transpose(-2, -1) swaps the last two dimensions of k
+            # with shape (B, num_heads, T, hs=dim_embed/num_heades)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            # self.bias is defined in the init function as lower triangular
+            # att: (B, num_heads, T, hs) x (B, num_heads, hs, T)
+            # # -> (B, num_heads, T, T), hs=dim_embed/num_heads
+            # (B, num_heads, T, T) is (B, num_heads) (T,T) attention matrix
+            # self.bias is defined in the init function via register_buffer
+            # as lower triangular (1, 1, config.block_size, config.block_size)
+            # where config.block_size is the length of the context window
+            # for each B, num_heads, we have the same mask for (T, T) where
+            # T=config.block_size is the length of the context window
+            # upper triangular is zero, lower triangular is one
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
+            # (T,T) attention matrix have [i,j>i] set to -inf, here j is the
+            # column index representing tokens comes after the current token
+            # for (T, T), keep the first T dimension intact, which correspond
+            # to each token in the context window, the second T dimension means
+            # each other token in the context window's attention to the current
+            # token
+            att = F.softmax(att, dim=-1)  # dim=-1 operate at the second T-dim
+            # softmax_i=e^{-x_i}/\sum_j{e^{-x_j}} put token after current
+            # token via -inf to 0, and normalize the rest to 1
+            # att now still has dimension (B, num_heads, T, T) but with the
+            # last T-dim only containing nonzero for tokens before current
+            # token
+            # def: self.attn_dropout = nn.Dropout(config.dropout)
             att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            # dropout randomly zeroes some of the elements of the input tensor
+            # with probability :attr:`p`, including B and num_heads dimension
+            # The zeroed elements are chosen independently for each forward
+            # call and are sampled from a Bernoulli distribution. Each channel
+            # will be zeroed out independently on every forward call.
+            y = att @ v  # (B, nh, T, [T]) x (B, nh, [T], hs) -> (B, nh, T, hs)
+            # attention weighted embedding for each token in dimension T
+            # ******
+            # since for current token, attention score of subsequent token is
+            # zero in dim [T], these zeros will zero out the value
+            # representation of each subsequent token, so for each token in y,
+            # each token representation only contains for the weighted sum
+            # representation of all tokens before it
+            # ******
+            # hs=dim_embed/num_heads
             # each token get a unique representation of size h_s for each head
-            # C is the size of embedding, divided into num_head(n_h) * hs
+            # C is the dim of embedding, divided into num_head(n_h) * hs
         y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # y is now (B, T,num_heads*hs) -> (B, T, C)
         # re-assemble all head outputs side by side
 
         # output projection
+        # def: self.c_proj = nn.Linear(dim_embed, dim_embd, bias=config.bias)
+        # def: self.resid_dropout = nn.Dropout(config.dropout)
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -124,6 +166,7 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        # 4*n_embd is the hidden layer size, totally arbitrary in this case
         self.c_fc = nn.Linear(
             config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu = nn.GELU()
@@ -163,6 +206,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
 
 class GPT(nn.Module):
 

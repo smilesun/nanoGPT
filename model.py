@@ -170,6 +170,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(
             config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu = nn.GELU()
+        # 4*n_embd is the hidden layer size, totally arbitrary in this case
         self.c_proj = nn.Linear(
             4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
@@ -179,6 +180,7 @@ class MLP(nn.Module):
         x = self.gelu(x)
         x = self.c_proj(x)
         x = self.dropout(x)
+        # after the operation, output is still dim_embedding
         return x
 
 
